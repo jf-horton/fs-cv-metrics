@@ -46,15 +46,20 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.0.0",
+    "mkdocstrings[python]>=0.24.0",
+]
 all = [
-    "foresight_metrics[clearml,dev]",
+    "foresight_metrics[clearml,dev,docs]",
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/foresight_metrics"
-Documentation = "https://github.com/yourusername/foresight_metrics#readme"
-Repository = "https://github.com/yourusername/foresight_metrics"
-Issues = "https://github.com/yourusername/foresight_metrics/issues"
+Homepage = "https://github.com/jf-horton/fs-cv-metrics"
+Documentation = "https://jf-horton.github.io/fs-cv-metrics/"
+Repository = "https://github.com/jf-horton/fs-cv-metrics"
+Issues = "https://github.com/jf-horton/fs-cv-metrics/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
