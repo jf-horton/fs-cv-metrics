@@ -54,6 +54,8 @@ nav:
     - Segmentation: api/segmentation.md
     - Loggers: api/loggers.md
     - MetricResult: api/results.md
+  - Contributing:
+    - Documentation: contributing/documentation.md
 
 markdown_extensions:
   - pymdownx.highlight:
