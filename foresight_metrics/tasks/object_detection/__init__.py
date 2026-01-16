@@ -20,11 +20,14 @@ BUILTIN_FORMATS: dict[str, Type] = {
     "coco": CocoFormat,
 }
 
-# Built-in metrics
+# Built-in metrics (all available)
 BUILTIN_METRICS: dict[str, Type] = {
     "mAP": MAPMetric,
     "precision_recall": PrecisionRecallMetric,
 }
+
+# Standard metrics (default when not specified)
+STANDARD_METRICS: list[str] = ["mAP", "precision_recall"]
 
 
 class ObjectDetection:
@@ -93,7 +96,7 @@ class ObjectDetection:
             )
 
         self._format_adapter = self._formats[data_format]()
-        self._metric_names = list(metrics) if metrics else list(BUILTIN_METRICS.keys())
+        self._metric_names = list(metrics) if metrics else STANDARD_METRICS.copy()
         self._loggers = list(loggers) if loggers else []
 
         # Validate metric names
