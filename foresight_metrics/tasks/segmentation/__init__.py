@@ -3,6 +3,8 @@ Segmentation - Main API for segmentation evaluation.
 """
 from typing import Sequence, Type
 
+import numpy as np
+
 from foresight_metrics.results import MetricResult
 from foresight_metrics.loggers.base import MetricsLogger
 from foresight_metrics.tasks.segmentation.types import SegData
@@ -39,33 +41,16 @@ class Segmentation:
         metric_names: Names of metrics to compute.
         loggers: List of loggers for output.
 
-    Example:
-        >>> from foresight_metrics.tasks.segmentation import Segmentation
-        >>> from foresight_metrics.loggers import StdoutLogger
-        >>> import numpy as np
-        >>>
-        >>> seg = Segmentation(
-        ...     data_format="numpy",
-        ...     num_classes=3,
-        ...     metrics=["iou", "dice"],
-        ...     loggers=[StdoutLogger()],
-        ... )
-        >>> gt = np.array([[[0, 0, 1], [1, 1, 2], [2, 2, 2]]])
-        >>> pred = np.array([[[0, 0, 1], [1, 1, 1], [2, 2, 2]]])
-        >>> result = seg.evaluate(gt, pred)
-        >>> print(result.metrics)
+    Example (update/compute pattern):
+        >>> seg = Segmentation(num_classes=3, loggers=[StdoutLogger()])
+        >>> for image, annotation in dataset:
+        ...     pred = model.predict(image)
+        ...     seg.update(gt_mask=annotation, pred_mask=pred)
+        >>> result = seg.compute()
 
-    Extension Example:
-        >>> # Add a custom metric
-        >>> class MyMetric:
-        ...     name = "my_metric"
-        ...     def compute(self, data): return {"my_metric": 0.5}
-        >>>
-        >>> seg = Segmentation(
-        ...     num_classes=3,
-        ...     metrics=["iou", "my_metric"],
-        ...     custom_metrics={"my_metric": MyMetric},
-        ... )
+    Example (file-based):
+        >>> seg = Segmentation(num_classes=3, data_format="numpy")
+        >>> result = seg.evaluate(gt_masks, pred_masks)
     """
 
     def __init__(
@@ -121,6 +106,10 @@ class Segmentation:
                     f"Unknown metric '{name}'. Available metrics: {available}"
                 )
 
+        # Internal accumulators for update/compute pattern
+        self._gt_masks: list[np.ndarray] = []
+        self._pred_masks: list[np.ndarray] = []
+
     @property
     def data_format(self) -> str:
         """Name of the configured data format."""
@@ -146,6 +135,93 @@ class Segmentation:
         """All available metric names (built-in + custom)."""
         return list(self._metrics.keys())
 
+    def reset(self) -> None:
+        """Clear all accumulated data for a fresh evaluation."""
+        self._gt_masks = []
+        self._pred_masks = []
+
+    def update(self, gt_mask: np.ndarray, pred_mask: np.ndarray) -> None:
+        """
+        Add masks for one image to internal accumulator.
+
+        Call this for each image during inference, then call compute()
+        to get final metrics.
+
+        Args:
+            gt_mask: Ground truth mask [H, W] with class indices.
+            pred_mask: Predicted mask [H, W] with class indices.
+
+        Example:
+            >>> seg = Segmentation(num_classes=3)
+            >>> for image, annotation in dataset:
+            ...     pred = model.predict(image)
+            ...     seg.update(gt_mask=annotation, pred_mask=pred)
+        """
+        gt_mask = np.asarray(gt_mask)
+        pred_mask = np.asarray(pred_mask)
+        self._gt_masks.append(gt_mask)
+        self._pred_masks.append(pred_mask)
+
+    def compute(self) -> MetricResult:
+        """
+        Compute metrics on accumulated data.
+
+        This method builds SegData from accumulated updates, computes all
+        requested metrics, logs results, and resets the internal state.
+
+        Returns:
+            MetricResult containing all computed metrics.
+
+        Raises:
+            ValueError: If no data has been accumulated via update().
+
+        Example:
+            >>> seg = Segmentation(num_classes=3)
+            >>> for image, annotation in dataset:
+            ...     seg.update(gt_mask=annotation, pred_mask=pred)
+            >>> result = seg.compute()  # Computes and auto-resets
+        """
+        if len(self._gt_masks) == 0:
+            raise ValueError("No data accumulated. Call update() before compute().")
+
+        # Build SegData from accumulated data
+        data = SegData(
+            gt_masks=np.stack(self._gt_masks),
+            pred_masks=np.stack(self._pred_masks),
+            num_classes=self._num_classes,
+            ignore_index=self._ignore_index,
+        )
+
+        # Compute metrics
+        all_metrics: dict[str, float] = {}
+        for name in self._metric_names:
+            metric_cls = self._metrics[name]
+            metric_instance = metric_cls()
+            result = metric_instance.compute(data)
+            all_metrics.update(result)
+
+        # Build result
+        result = MetricResult(
+            task_name="segmentation",
+            metrics=all_metrics,
+            metadata={
+                "format": "accumulated",
+                "num_images": data.num_images,
+                "num_classes": data.num_classes,
+                "image_shape": data.image_shape,
+                "total_pixels": data.total_pixels,
+            },
+        )
+
+        # Log to all loggers
+        for logger in self._loggers:
+            logger.log(result)
+
+        # Auto-reset after compute
+        self.reset()
+
+        return result
+
     def evaluate(self, ground_truth, predictions) -> MetricResult:
         """
         Evaluate predictions against ground truth.
@@ -161,10 +237,7 @@ class Segmentation:
             predictions: Path to prediction file(s), or numpy array of masks.
 
         Returns:
-            MetricResult containing all computed metrics, with fields:
-            - task_name: "segmentation"
-            - metrics: dict of metric name -> value
-            - metadata: additional info about the evaluation
+            MetricResult containing all computed metrics.
 
         Raises:
             ValueError: If data format is invalid.
@@ -203,3 +276,4 @@ class Segmentation:
             logger.log(result)
 
         return result
+

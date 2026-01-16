@@ -3,6 +3,8 @@ ObjectDetection - Main API for object detection evaluation.
 """
 from typing import Sequence, Type
 
+import numpy as np
+
 from foresight_metrics.results import MetricResult
 from foresight_metrics.loggers.base import MetricsLogger
 from foresight_metrics.tasks.object_detection.types import ODData
@@ -38,39 +40,22 @@ class ObjectDetection:
         metric_names: Names of metrics to compute.
         loggers: List of loggers for output.
 
-    Example:
-        >>> from foresight_metrics.tasks.object_detection import ObjectDetection
-        >>> from foresight_metrics.loggers import StdoutLogger, ClearMLLogger
-        >>>
-        >>> od = ObjectDetection(
-        ...     data_format="coco",
-        ...     metrics=["mAP", "precision_recall"],
-        ...     loggers=[StdoutLogger()],
-        ... )
+    Example (update/compute pattern):
+        >>> od = ObjectDetection(metrics=["mAP"], loggers=[StdoutLogger()])
+        >>> for image, annotation in dataset:
+        ...     preds = model.predict(image)
+        ...     od.update(
+        ...         gt_boxes=annotation.xyxy,
+        ...         gt_labels=annotation.class_id,
+        ...         pred_boxes=preds.xyxy,
+        ...         pred_labels=preds.class_id,
+        ...         pred_scores=preds.confidence,
+        ...     )
+        >>> result = od.compute()
+
+    Example (file-based):
+        >>> od = ObjectDetection(data_format="coco")
         >>> result = od.evaluate("ground_truth.json", "predictions.json")
-        >>> print(result.metrics)
-        {'mAP': 0.65, 'mAP@0.5': 0.82, 'mAP@0.75': 0.48, 'precision': 0.85, ...}
-
-    Extension Example:
-        >>> # Add a custom format
-        >>> class YoloFormat:
-        ...     name = "yolo"
-        ...     def load(self, gt, preds): ...
-        >>>
-        >>> od = ObjectDetection(
-        ...     data_format="yolo",
-        ...     custom_formats={"yolo": YoloFormat},
-        ... )
-
-        >>> # Add a custom metric
-        >>> class MyMetric:
-        ...     name = "my_metric"
-        ...     def compute(self, data): return {"my_metric": 0.5}
-        >>>
-        >>> od = ObjectDetection(
-        ...     metrics=["mAP", "my_metric"],
-        ...     custom_metrics={"my_metric": MyMetric},
-        ... )
     """
 
     def __init__(
@@ -119,6 +104,17 @@ class ObjectDetection:
                     f"Unknown metric '{name}'. Available metrics: {available}"
                 )
 
+        # Internal accumulators for update/compute pattern
+        self._image_count = 0
+        self._gt_image_ids: list[int] = []
+        self._gt_boxes: list[np.ndarray] = []
+        self._gt_labels: list[int] = []
+        self._pred_image_ids: list[int] = []
+        self._pred_boxes: list[np.ndarray] = []
+        self._pred_labels: list[int] = []
+        self._pred_scores: list[float] = []
+        self._class_names: dict[int, str] | None = None
+
     @property
     def data_format(self) -> str:
         """Name of the configured data format."""
@@ -139,9 +135,138 @@ class ObjectDetection:
         """All available metric names (built-in + custom)."""
         return list(self._metrics.keys())
 
+    def reset(self) -> None:
+        """Clear all accumulated data for a fresh evaluation."""
+        self._image_count = 0
+        self._gt_image_ids = []
+        self._gt_boxes = []
+        self._gt_labels = []
+        self._pred_image_ids = []
+        self._pred_boxes = []
+        self._pred_labels = []
+        self._pred_scores = []
+
+    def update(
+        self,
+        gt_boxes: np.ndarray,
+        gt_labels: np.ndarray,
+        pred_boxes: np.ndarray,
+        pred_labels: np.ndarray,
+        pred_scores: np.ndarray,
+    ) -> None:
+        """
+        Add detections for one image to internal accumulator.
+
+        Call this for each image during inference, then call compute()
+        to get final metrics.
+
+        Args:
+            gt_boxes: Ground truth boxes [N, 4] in xyxy format.
+            gt_labels: Ground truth class labels [N].
+            pred_boxes: Predicted boxes [M, 4] in xyxy format.
+            pred_labels: Predicted class labels [M].
+            pred_scores: Prediction confidence scores [M].
+
+        Example:
+            >>> od = ObjectDetection()
+            >>> for image, annotation in dataset:
+            ...     preds = model.predict(image)
+            ...     od.update(
+            ...         gt_boxes=annotation.xyxy,
+            ...         gt_labels=annotation.class_id,
+            ...         pred_boxes=preds.xyxy,
+            ...         pred_labels=preds.class_id,
+            ...         pred_scores=preds.confidence,
+            ...     )
+        """
+        image_id = self._image_count
+        self._image_count += 1
+
+        # Accumulate ground truth
+        if gt_boxes is not None and len(gt_boxes) > 0:
+            gt_boxes = np.asarray(gt_boxes)
+            gt_labels = np.asarray(gt_labels)
+            self._gt_image_ids.extend([image_id] * len(gt_boxes))
+            self._gt_boxes.append(gt_boxes)
+            self._gt_labels.extend(gt_labels.tolist())
+
+        # Accumulate predictions
+        if pred_boxes is not None and len(pred_boxes) > 0:
+            pred_boxes = np.asarray(pred_boxes)
+            pred_labels = np.asarray(pred_labels)
+            pred_scores = np.asarray(pred_scores)
+            self._pred_image_ids.extend([image_id] * len(pred_boxes))
+            self._pred_boxes.append(pred_boxes)
+            self._pred_labels.extend(pred_labels.tolist())
+            self._pred_scores.extend(pred_scores.tolist())
+
+    def compute(self) -> MetricResult:
+        """
+        Compute metrics on accumulated data.
+
+        This method builds ODData from accumulated updates, computes all
+        requested metrics, logs results, and resets the internal state.
+
+        Returns:
+            MetricResult containing all computed metrics.
+
+        Raises:
+            ValueError: If no data has been accumulated via update().
+
+        Example:
+            >>> od = ObjectDetection()
+            >>> for image, annotation in dataset:
+            ...     od.update(gt_boxes=..., pred_boxes=...)
+            >>> result = od.compute()  # Computes and auto-resets
+        """
+        if self._image_count == 0:
+            raise ValueError("No data accumulated. Call update() before compute().")
+
+        # Build ODData from accumulated data
+        data = ODData(
+            gt_image_ids=np.array(self._gt_image_ids, dtype=np.int64),
+            gt_boxes=np.vstack(self._gt_boxes).astype(np.float32) if self._gt_boxes else np.empty((0, 4), dtype=np.float32),
+            gt_labels=np.array(self._gt_labels, dtype=np.int64),
+            pred_image_ids=np.array(self._pred_image_ids, dtype=np.int64),
+            pred_boxes=np.vstack(self._pred_boxes).astype(np.float32) if self._pred_boxes else np.empty((0, 4), dtype=np.float32),
+            pred_labels=np.array(self._pred_labels, dtype=np.int64),
+            pred_scores=np.array(self._pred_scores, dtype=np.float32),
+            class_names=self._class_names,
+        )
+
+        # Compute metrics
+        all_metrics: dict[str, float] = {}
+        for name in self._metric_names:
+            metric_cls = self._metrics[name]
+            metric_instance = metric_cls()
+            result = metric_instance.compute(data)
+            all_metrics.update(result)
+
+        # Build result
+        result = MetricResult(
+            task_name="object_detection",
+            metrics=all_metrics,
+            metadata={
+                "format": "accumulated",
+                "num_gt_boxes": data.num_gt_boxes,
+                "num_predictions": data.num_predictions,
+                "num_images": data.num_images,
+                "num_classes": len(data.unique_labels),
+            },
+        )
+
+        # Log to all loggers
+        for logger in self._loggers:
+            logger.log(result)
+
+        # Auto-reset after compute
+        self.reset()
+
+        return result
+
     def evaluate(self, ground_truth, predictions) -> MetricResult:
         """
-        Evaluate predictions against ground truth.
+        Evaluate predictions against ground truth from files.
 
         This method:
         1. Loads data using the configured format adapter
@@ -156,10 +281,7 @@ class ObjectDetection:
                         in the configured format.
 
         Returns:
-            MetricResult containing all computed metrics, with fields:
-            - task_name: "object_detection"
-            - metrics: dict of metric name -> value
-            - metadata: additional info about the evaluation
+            MetricResult containing all computed metrics.
 
         Raises:
             ValueError: If data format is invalid.
@@ -199,31 +321,13 @@ class ObjectDetection:
         """
         Evaluate metrics directly from ODData.
 
-        Use this when you've already constructed ODData in memory,
-        e.g., from running inference in a loop. This bypasses the
-        format adapter entirely.
+        Use this when you've already constructed ODData in memory.
 
         Args:
             data: ODData containing ground truth and predictions.
 
         Returns:
             MetricResult containing all computed metrics.
-
-        Example:
-            >>> from foresight_metrics.tasks.object_detection.types import ODData
-            >>> import numpy as np
-            >>>
-            >>> data = ODData(
-            ...     gt_image_ids=np.array([0, 0]),
-            ...     gt_boxes=np.array([[10, 10, 50, 50], [60, 60, 100, 100]]),
-            ...     gt_labels=np.array([0, 1]),
-            ...     pred_image_ids=np.array([0, 0]),
-            ...     pred_boxes=np.array([[12, 12, 48, 48], [58, 58, 102, 102]]),
-            ...     pred_labels=np.array([0, 1]),
-            ...     pred_scores=np.array([0.9, 0.85]),
-            ... )
-            >>> od = ObjectDetection()
-            >>> result = od.evaluate_data(data)
         """
         # Compute all requested metrics
         all_metrics: dict[str, float] = {}
@@ -251,3 +355,4 @@ class ObjectDetection:
             logger.log(result)
 
         return result
+
